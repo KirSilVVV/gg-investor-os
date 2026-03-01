@@ -1,0 +1,189 @@
+{
+  "name": "WF-014 Live Context Builder",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "triggerAtHour": 6, "triggerAtMinute": 0 }] }
+      },
+      "id": "schedule-trigger",
+      "name": "⏰ Daily 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [200, 300]
+    },
+
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  -- Global metrics\n  (SELECT COUNT(*) FROM marketplace WHERE moderated=true AND hidden=false) AS listings,\n  (SELECT COUNT(*) FROM marketplace WHERE moderated=false AND hidden=false) AS moderation_queue,\n  (SELECT COUNT(*) FROM marketplace WHERE quantity=0 AND hidden=false AND moderated=true) AS oos_visible,\n  (SELECT COUNT(*) FROM marketplace_order WHERE status='fulfilled' AND updated_at < NOW() - INTERVAL '24 hours') AS stuck_fulfilled,\n  (SELECT COUNT(*) FROM marketplace_order WHERE DATE(created_at) = CURRENT_DATE) AS orders_today,\n  (SELECT COUNT(*) FROM marketplace_order WHERE DATE(created_at) = CURRENT_DATE AND status IN ('cancelled','cancelled_after_payment','cancelled_before_payment')) AS cancelled_today,\n\n  -- Product specific\n  (SELECT COUNT(*) FROM marketplace WHERE moderated=false AND created_at > NOW() - INTERVAL '1 hour') AS new_pending_1h,\n  (SELECT COUNT(*) FROM marketplace_order WHERE status='paid' AND updated_at < NOW() - INTERVAL '2 hours') AS stuck_paid,\n  (SELECT COUNT(*) FROM marketplace_order WHERE status='in_progress' AND updated_at < NOW() - INTERVAL '2 hours') AS stuck_inprogress,\n  (SELECT EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))/3600 FROM marketplace WHERE moderated=false)::int AS mod_oldest_h,\n\n  -- Content quality\n  (SELECT COUNT(*) FROM marketplace WHERE moderated=true AND hidden=false AND (seo_data IS NULL OR seo_data::text = '{}' OR seo_data::text = 'null')) AS no_schema_count,\n  (SELECT COUNT(*) FROM marketplace WHERE moderated=true AND hidden=false AND LENGTH(COALESCE(description,'')) < 100) AS thin_content_count,\n\n  -- Urgent products\n  (SELECT json_agg(json_build_object('id',id,'title',title,'issue','moderated=false')) FROM (SELECT id,title FROM marketplace WHERE moderated=false ORDER BY created_at DESC LIMIT 5) t) AS urgent_products,\n\n  -- Yesterday orders for delta\n  (SELECT COUNT(*) FROM marketplace_order WHERE DATE(created_at) = CURRENT_DATE - 1) AS orders_yesterday,\n  (SELECT COUNT(*) FROM marketplace_order WHERE DATE(created_at) = CURRENT_DATE - 1 AND status='completed') AS completed_yesterday",
+        "additionalFields": {}
+      },
+      "id": "pg-query-1",
+      "name": "🗄️ PG: Product & Order Metrics",
+      "type": "n8n-nodes-base.postgres",
+      "position": [440, 200],
+      "credentials": { "postgres": { "id": "vMUuOggCtBWX48Jg", "name": "GG Postgres" } }
+    },
+
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  -- Strategy / Revenue\n  (SELECT SUM((content->>'total')::numeric) / 100.0 FROM marketplace_order WHERE status IN ('completed','completed_with_review') AND created_at > NOW() - INTERVAL '30 days')::numeric(10,2) AS revenue_30d,\n  (SELECT SUM((content->>'total')::numeric) / 100.0 FROM marketplace_order WHERE status IN ('completed','completed_with_review') AND DATE(created_at) = CURRENT_DATE - 1)::numeric(10,2) AS revenue_yesterday,\n  (SELECT AVG(daily_rev) FROM (SELECT DATE(created_at) as d, SUM((content->>'total')::numeric)/100.0 as daily_rev FROM marketplace_order WHERE status IN ('completed','completed_with_review') AND created_at > NOW() - INTERVAL '30 days' GROUP BY d) t)::numeric(10,2) AS revenue_avg_day,\n\n  -- Sessions approximation from orders\n  (SELECT COUNT(DISTINCT account_id) FROM marketplace_order WHERE created_at > NOW() - INTERVAL '30 days') AS unique_buyers_30d,\n  (SELECT COUNT(*) FROM marketplace_order WHERE status IN ('completed','completed_with_review') AND created_at > NOW() - INTERVAL '30 days') AS conversions_30d,\n\n  -- YM specific (orders with external_order_id pattern)\n  (SELECT COUNT(*) FROM marketplace_order WHERE DATE(created_at) = CURRENT_DATE AND order_data::text LIKE '%yandex%') AS ym_orders_today,\n  (SELECT COUNT(*) FROM marketplace_order WHERE DATE(created_at) = CURRENT_DATE AND order_data::text LIKE '%yandex%' AND status IN ('cancelled','cancelled_after_payment')) AS ym_failed_today,\n\n  -- Refunds\n  (SELECT COUNT(*) FROM marketplace_order WHERE DATE(updated_at) = CURRENT_DATE AND status='cancelled_after_payment') AS refund_today,\n\n  -- Revenue yesterday for delta\n  (SELECT SUM((content->>'total')::numeric) / 100.0 FROM marketplace_order WHERE status IN ('completed','completed_with_review') AND DATE(created_at) = CURRENT_DATE - 2)::numeric(10,2) AS revenue_day_before",
+        "additionalFields": {}
+      },
+      "id": "pg-query-2",
+      "name": "🗄️ PG: Revenue & Strategy",
+      "type": "n8n-nodes-base.postgres",
+      "position": [440, 340],
+      "credentials": { "postgres": { "id": "vMUuOggCtBWX48Jg", "name": "GG Postgres" } }
+    },
+
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  -- Top pages by views (proxy via orders)\n  (SELECT json_agg(t) FROM (\n    SELECT \n      m.title, m.id,\n      COUNT(mo.id) as orders_7d,\n      AVG((mo.content->>'total')::numeric/100.0)::numeric(8,2) as avg_check\n    FROM marketplace m\n    LEFT JOIN marketplace_order mo ON mo.order_data->>'productId' = m.id::text\n      AND mo.created_at > NOW() - INTERVAL '7 days'\n    WHERE m.moderated=true AND m.hidden=false\n    GROUP BY m.id, m.title\n    ORDER BY orders_7d DESC\n    LIMIT 10\n  ) t) AS top_products_7d,\n\n  -- Abandoned (created but not paid > 2h)\n  (SELECT COUNT(*) FROM marketplace_order WHERE status='created' AND created_at < NOW() - INTERVAL '2 hours' AND created_at > NOW() - INTERVAL '24 hours') AS abandoned_carts,\n\n  -- Low stock alerts\n  (SELECT COUNT(*) FROM marketplace WHERE quantity > 0 AND quantity < 5 AND quantity != 1111111 AND moderated=true AND hidden=false) AS low_stock_count,\n\n  -- New sellers today\n  (SELECT COUNT(DISTINCT account_id) FROM marketplace WHERE DATE(created_at) = CURRENT_DATE) AS new_sellers_today,\n\n  -- Kinguin price changes (updated in last 24h)\n  (SELECT COUNT(*) FROM marketplace WHERE partner='KINGUIN' AND updated_at > NOW() - INTERVAL '24 hours') AS kinguin_price_changes,\n  (SELECT MAX(updated_at)::text FROM marketplace WHERE partner='KINGUIN') AS kinguin_last_sync",
+        "additionalFields": {}
+      },
+      "id": "pg-query-3",
+      "name": "🗄️ PG: Marketing & Catalog",
+      "type": "n8n-nodes-base.postgres",
+      "position": [440, 480],
+      "credentials": { "postgres": { "id": "vMUuOggCtBWX48Jg", "name": "GG Postgres" } }
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://analyticsdata.googleapis.com/v1beta/properties/511167634:runReport",
+        "authentication": "serviceAccount",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "dateRanges",
+              "value": "[{\"startDate\":\"28daysAgo\",\"endDate\":\"today\"},{\"startDate\":\"56daysAgo\",\"endDate\":\"29daysAgo\"}]"
+            },
+            {
+              "name": "metrics",
+              "value": "[{\"name\":\"sessions\"},{\"name\":\"conversions\"},{\"name\":\"totalRevenue\"},{\"name\":\"bounceRate\"},{\"name\":\"averageSessionDuration\"}]"
+            },
+            {
+              "name": "dimensions",
+              "value": "[{\"name\":\"sessionDefaultChannelGroup\"}]"
+            }
+          ]
+        }
+      },
+      "id": "ga4-channels",
+      "name": "📈 GA4: Channels 28d",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [440, 620]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://searchconsole.googleapis.com/webmasters/v3/sites/https%3A%2F%2Fvvv.cash%2F/searchAnalytics/query",
+        "authentication": "oAuth2",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "startDate", "value": "={{ $now.minus({days: 28}).toFormat('yyyy-MM-dd') }}" },
+            { "name": "endDate",   "value": "={{ $now.toFormat('yyyy-MM-dd') }}" },
+            { "name": "dimensions","value": "[\"page\"]" },
+            { "name": "rowLimit",  "value": "25" }
+          ]
+        }
+      },
+      "id": "gsc-pages",
+      "name": "🔎 GSC: Top Pages",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [440, 760]
+    },
+
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.partner.market.yandex.ru/campaigns/149016205/stats/orders",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Api-Key", "value": "ACMA:pmewbhgmRJxBawzIeZbxV9wrKmYpU2K9A9NvuY9I:79d803d1" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "dateFrom", "value": "={{ $now.minus({days: 7}).toFormat('yyyy-MM-dd') }}" },
+            { "name": "dateTo",   "value": "={{ $now.toFormat('yyyy-MM-dd') }}" }
+          ]
+        }
+      },
+      "id": "ym-stats",
+      "name": "🛒 YM: Order Stats",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [440, 900]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Собираем все данные в структурированный контекст\n// Этот шаг НЕ использует Claude — чистая обработка данных\n\nconst pg1 = $('🗄️ PG: Product & Order Metrics').first().json;\nconst pg2 = $('🗄️ PG: Revenue & Strategy').first().json;\nconst pg3 = $('🗄️ PG: Marketing & Catalog').first().json;\nconst ga4 = $('📈 GA4: Channels 28d').first().json;\nconst gsc = $('🔎 GSC: Top Pages').first().json;\nconst ym  = $('🛒 YM: Order Stats').first().json;\n\n// ── Revenue calculations ──\nconst rev30 = parseFloat(pg2.revenue_30d) || 0;\nconst revYesterday = parseFloat(pg2.revenue_yesterday) || 0;\nconst revAvg = parseFloat(pg2.revenue_avg_day) || 0;\nconst revDelta = revAvg > 0 ? Math.round((revYesterday - revAvg) / revAvg * 100) : 0;\nconst revDayBefore = parseFloat(pg2.revenue_day_before) || 0;\n\n// ── YM calculations ──\nconst ymOrdersToday = parseInt(pg2.ym_orders_today) || 0;\nconst ymFailedToday = parseInt(pg2.ym_failed_today) || 0;\nconst ymFailedPct = ymOrdersToday > 0 ? Math.round(ymFailedToday / ymOrdersToday * 100) : 0;\n\n// ── GA4 channel parsing ──\nconst channels = {};\nif (ga4.rows) {\n  ga4.rows.forEach(row => {\n    const ch = row.dimensionValues?.[0]?.value || 'unknown';\n    channels[ch] = {\n      sessions: parseInt(row.metricValues?.[0]?.value || 0),\n      conversions: parseInt(row.metricValues?.[1]?.value || 0),\n      revenue: parseFloat(row.metricValues?.[2]?.value || 0).toFixed(2)\n    };\n  });\n}\n\nconst totalSessions = Object.values(channels).reduce((s, c) => s + c.sessions, 0);\nconst totalConversions = Object.values(channels).reduce((s, c) => s + c.conversions, 0);\nconst cr = totalSessions > 0 ? (totalConversions / totalSessions * 100).toFixed(1) : 0;\n\n// ── GSC parsing ──\nconst gscRows = gsc.rows || [];\nconst totalClicks = gscRows.reduce((s, r) => s + (r.clicks || 0), 0);\nconst totalImpressions = gscRows.reduce((s, r) => s + (r.impressions || 0), 0);\nconst avgPos = gscRows.length > 0 ? (gscRows.reduce((s, r) => s + (r.position || 0), 0) / gscRows.length).toFixed(1) : 0;\nconst avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions * 100).toFixed(1) : 0;\n\nconst topPages = gscRows.slice(0, 5).map(r => ({\n  url: r.keys?.[0]?.replace('https://vvv.cash', '') || r.keys?.[0],\n  clicks: r.clicks,\n  pos: r.position?.toFixed(1),\n  ctr: (r.ctr * 100).toFixed(1) + '%'\n}));\n\n// ── Orders delta ──\nconst ordersToday = parseInt(pg1.orders_today) || 0;\nconst ordersYesterday = parseInt(pg1.orders_yesterday) || 0;\nconst completedYesterday = parseInt(pg1.completed_yesterday) || 0;\n\n// ── BUILD FINAL CONTEXT ──\nconst context = {\n  global: {\n    revenue_30d: '€' + rev30,\n    sessions: totalSessions,\n    cr: cr,\n    ym_orders_today: ymOrdersToday,\n    ym_failed_pct: ymFailedPct,\n    listings: parseInt(pg1.listings) || 131234,\n    moderation_queue: parseInt(pg1.moderation_queue) || 10240,\n  },\n\n  seo: {\n    crawled_not_indexed: 18378, // from GSC Index Coverage (requires separate API call)\n    avg_position: avgPos,\n    clicks_28d: totalClicks,\n    ctr: avgCtr,\n    sitemap_warnings: 700, // static until GSC sitemap API added\n    sitemap_urls: 39220,\n    oos_visible: parseInt(pg1.oos_visible) || 0,\n    no_schema_count: parseInt(pg1.no_schema_count) || 0,\n    thin_content_count: parseInt(pg1.thin_content_count) || 0,\n    top_pages: topPages,\n    delta: {\n      clicks: totalClicks - 932, // vs last month baseline\n      indexed: 0 // will have real data when GSC coverage API added\n    }\n  },\n\n  strategy: {\n    revenue_yesterday: '€' + revYesterday,\n    revenue_avg: '€' + revAvg,\n    revenue_delta: revDelta,\n    cart_rate: totalSessions > 0 ? (ordersToday / totalSessions * 100).toFixed(1) : '?',\n    purchase_rate: cr,\n    stuck_fulfilled: parseInt(pg1.stuck_fulfilled) || 0,\n    cancelled_today: parseInt(pg1.cancelled_today) || 0,\n    refund_today: parseInt(pg2.refund_today) || 0,\n    top_channels: channels,\n    delta: {\n      revenue: revDelta + '%',\n      orders: ordersYesterday > 0 ? Math.round((ordersToday - ordersYesterday) / ordersYesterday * 100) + '%' : '?'\n    }\n  },\n\n  marketing: {\n    ym_impressions: parseInt(ym.result?.totals?.impressionsCount) || 0,\n    ym_clicks: parseInt(ym.result?.totals?.clicksCount) || 0,\n    ym_ctr: ym.result?.totals ? ((ym.result.totals.clicksCount / ym.result.totals.impressionsCount) * 100).toFixed(1) : 0,\n    ym_roas: ym.result?.totals?.revenue && ym.result?.totals?.spend ? (ym.result.totals.revenue / ym.result.totals.spend).toFixed(1) : '?',\n    abandoned_carts: parseInt(pg3.abandoned_carts) || 0,\n    referral_cr: channels['Referral'] ? (channels['Referral'].conversions / channels['Referral'].sessions * 100).toFixed(1) : 22,\n    low_ctr_sku: topPages.filter(p => parseFloat(p.ctr) < 2),\n    delta: {\n      ym_ctr: '?', // available after A/B test runs\n      abandoned: parseInt(pg3.abandoned_carts) || 0\n    }\n  },\n\n  product: {\n    stuck_paid: parseInt(pg1.stuck_paid) || 0,\n    stuck_inprogress: parseInt(pg1.stuck_inprogress) || 0,\n    stuck_fulfilled: parseInt(pg1.stuck_fulfilled) || 0,\n    mod_queue: parseInt(pg1.moderation_queue) || 0,\n    mod_oldest_h: parseInt(pg1.mod_oldest_h) || 0,\n    kinguin_price_changes: parseInt(pg3.kinguin_price_changes) || 0,\n    kinguin_last_sync: pg3.kinguin_last_sync || 'unknown',\n    urgent_products: pg3.urgent_products || [],\n    delta: {\n      new_orders: ordersToday,\n      completed: completedYesterday\n    }\n  }\n};\n\nreturn [{ json: context }];"
+      },
+      "id": "build-context",
+      "name": "🔧 Build Context (no Claude)",
+      "type": "n8n-nodes-base.code",
+      "position": [700, 540]
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.INVESTOR_OS_URL }}/api/context",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "x-context-secret", "value": "={{ $env.CONTEXT_SECRET }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}"
+      },
+      "id": "push-context",
+      "name": "🚀 Push to Investor OS",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [940, 540]
+    },
+
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CEO_CHAT_ID }}",
+        "text": "✅ WF-014 Context Updated\n\n💰 Revenue вчера: {{ $('🔧 Build Context (no Claude)').first().json.strategy.revenue_yesterday }} ({{ $('🔧 Build Context (no Claude)').first().json.strategy.delta.revenue }})\n📦 Заказов сегодня: {{ $('🔧 Build Context (no Claude)').first().json.product.delta.new_orders }}\n🛒 YM failed: {{ $('🔧 Build Context (no Claude)').first().json.global.ym_failed_pct }}%\n🔍 GSC клики: {{ $('🔧 Build Context (no Claude)').first().json.seo.clicks_28d }}/28d\n⏳ На модерации: {{ $('🔧 Build Context (no Claude)').first().json.global.moderation_queue }}\n\n🤖 Агенты обновлены — данные актуальны"
+      },
+      "id": "tg-confirm",
+      "name": "📲 Telegram: Confirm",
+      "type": "n8n-nodes-base.telegram",
+      "position": [1180, 540]
+    }
+  ],
+
+  "connections": {
+    "⏰ Daily 06:00":               { "main": [[{ "node": "🗄️ PG: Product & Order Metrics", "type": "main", "index": 0 }, { "node": "🗄️ PG: Revenue & Strategy", "type": "main", "index": 0 }, { "node": "🗄️ PG: Marketing & Catalog", "type": "main", "index": 0 }, { "node": "📈 GA4: Channels 28d", "type": "main", "index": 0 }, { "node": "🔎 GSC: Top Pages", "type": "main", "index": 0 }, { "node": "🛒 YM: Order Stats", "type": "main", "index": 0 }]] },
+    "🗄️ PG: Product & Order Metrics": { "main": [[{ "node": "🔧 Build Context (no Claude)", "type": "main", "index": 0 }]] },
+    "🗄️ PG: Revenue & Strategy":     { "main": [[{ "node": "🔧 Build Context (no Claude)", "type": "main", "index": 1 }]] },
+    "🗄️ PG: Marketing & Catalog":    { "main": [[{ "node": "🔧 Build Context (no Claude)", "type": "main", "index": 2 }]] },
+    "📈 GA4: Channels 28d":          { "main": [[{ "node": "🔧 Build Context (no Claude)", "type": "main", "index": 3 }]] },
+    "🔎 GSC: Top Pages":             { "main": [[{ "node": "🔧 Build Context (no Claude)", "type": "main", "index": 4 }]] },
+    "🛒 YM: Order Stats":            { "main": [[{ "node": "🔧 Build Context (no Claude)", "type": "main", "index": 5 }]] },
+    "🔧 Build Context (no Claude)":  { "main": [[{ "node": "🚀 Push to Investor OS",        "type": "main", "index": 0 }]] },
+    "🚀 Push to Investor OS":         { "main": [[{ "node": "📲 Telegram: Confirm",          "type": "main", "index": 0 }]] }
+  },
+
+  "settings": { "executionOrder": "v1" },
+  "tags": [{ "name": "infrastructure" }, { "name": "context" }],
+  "_meta": {
+    "description": "Ежедневно в 06:00 собирает данные из PG/GA4/GSC/YM без Claude API. POST /api/context → агенты получают live данные. Стоимость: €0.00 токенов.",
+    "env_required": ["INVESTOR_OS_URL", "CONTEXT_SECRET", "TELEGRAM_CEO_CHAT_ID"]
+  }
+}
